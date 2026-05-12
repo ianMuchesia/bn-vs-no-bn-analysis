@@ -20,101 +20,56 @@ from src.validation import validate
 
 
 
-def build_model(config):
-    if config == "plain":
-        return PlainCNN()
 
-    elif config == "bn":
-        return CNNWithBatchNorm()
 
-    elif config == "skip":
-        return ResNetWithoutBN()
 
-    elif config == "resnet":
-        return FullResNet()
+def training_model(model,config_name,train_loader,test_loader,device):
     
     
-    
-    #1. Define transform ( Turn images into tensors )
-transform = transforms.Compose([transforms.ToTensor(),transforms.RandomHorizontalFlip()])
-
-
-
-#2. Download/Load datasets
-train_dataset = torchvision.datasets.CIFAR10(root="./../experiments/data",train=True,download=True, transform=transform)
-
-
-test_dataset = torchvision.datasets.CIFAR10(root="./../experiments/data",train=False,download=True, transform=transform)
-
-# 2.5 Create a subset of 1000 images
-subset_indices = list(range(10000))
-train_subset = Subset(train_dataset, subset_indices)
-test_subset = Subset(test_dataset,subset_indices)
-
-
-#3. Create loaders
-train_loader = DataLoader(train_subset,batch_size=64,shuffle=True)
-test_loader = DataLoader(test_subset,batch_size=64,shuffle=False)
-
-
-#4. Sanity check
-data_iter = iter(train_loader)
-images,labels = next(data_iter)
-
-
-
-#5.Device check
-device = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
-
-
-print(f"Batch Images Shape: {images.shape}")
-#(batch_size, channels, height,width)
-
-print(f"Batch Labels Shape: {labels.shape}")
-
-
-
-
-
-def training_model(model,config_name):
-    model = build_model("plain")
-
-    gradients = {}
-
-    #We register them to the main blocks to track the highway
-    model.fc.register_full_backward_hook(get_gradient_hook("5_fc",gradients))
-    #model.fc1.register_full_backward_hook(get_gradient_hook("5_fc1",gradients))
-    model.conv4.register_full_backward_hook(get_gradient_hook("4_Layer3",gradients))
-    model.conv3.register_full_backward_hook(get_gradient_hook("3_Layer2",gradients))
-    model.conv2.register_full_backward_hook(get_gradient_hook("2_Layer1",gradients))
-    model.conv1.register_full_backward_hook(get_gradient_hook("1_conv1",gradients))
-
-    criterion = torch.nn.CrossEntropyLoss()
+    print(f"\n--- Starting Experiment : {config_name.upper()} ---")
     
     
-        
-    optimizer = optim.SGD(model.parameters(),lr=0.01,momentum=0.9,weight_decay=1e-4)
+    #1. Hardware Mapping
+    model = model.to(device)
+
+    criterion = torch.nn.CrossEntropyLoss() 
+    optimizer = optim.SGD(model.parameters(),lr=0.001,momentum=0.9,weight_decay=1e-4)
 
 
     #Training Loop
     epochs = 15
     best_accuracy = 0.0
+    best_val_loss = float('inf')
     history = []
     checkpoint_dir = "experiments/run_latest"
 
-    epoch_gradient_history = []
+    epoch_gradient_history = {}
     
-    start_time = time.perf_counter()
+    target_layers = [ 'conv1.weight','conv2.weight', 'conv3.weight','conv4.weight','fc.weight']
+    
+    
+    for layer in target_layers:
+        epoch_gradient_history[layer] = []
+    
+    starting_time = time.perf_counter()
 
 
     for epoch in range(epochs):
+        model.train()
         running_loss = 0.0
         correct = 0
         total = 0
-        best_val_loss = float('inf')
+        
+        
+        # Accumulators for gradient magnitudes per layer for this specific epoch
+        grad_accumulators = {layer: 0.0 for layer in target_layers}
+        
+        epoch_start_time = time.perf_counter()
         
         
         for i,(images,labels) in enumerate(train_loader):
+            
+            images,labels = images.to(device),labels.to(device)
             #Zero gradient
             optimizer.zero_grad()
             
@@ -129,13 +84,13 @@ def training_model(model,config_name):
             #Backward Pass + update
             loss.backward()
             
-            if(i == 0):
-                print(f"Gradients at Epoch {epoch+1} :{gradients}")
-                epoch_gradient_history.append(gradients.copy())
+            #GRADIENT TRACKING
+            for name, param in model.named_parameters():
+                if name in target_layers and param.grad is not None:
+                    #Calculate the L2 norm (magnitude) of the gradient tensor
+                    grad_magnitude = param.grad.data.norm(2).item()
+                    grad_accumulators[name] += grad_magnitude
                 
-                
-
-            
             optimizer.step()
             
             
@@ -154,65 +109,63 @@ def training_model(model,config_name):
         #Print stats per epoch
         train_accuracy = 100 * correct/total
         
+        avg_train_loss = running_loss / len(train_loader)
+        
         print(f"Epoch [{epoch + 1}/{epochs}] - Loss: {running_loss/len(train_loader):.4f} -Training Accuracy: {train_accuracy:.2f}%")
         
-        
-        avg_loss, accuracy = validate(model, test_loader,criterion,device)
-        
-        
-        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {running_loss/len(train_loader):.4f} - Test Accuracy: {accuracy:.2f}%")
-        
-        
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
+        epoch_grads = {}
+        for layer in target_layers:
+            avg_grad = grad_accumulators[layer] / len(train_loader)
+            epoch_gradient_history[layer].append(avg_grad)
+            epoch_grads[layer] = avg_grad
             
             
-            
-        time.sleep(1).perf_counter()
+        #Validation Phase
+        #Assuming you validate() function sets model.eval() and uses torch.no_grad()      
+        avg_val_loss, val_accuracy = validate(model, test_loader,criterion,device)
         
         
-        elapsed_time = end_time - start_time
+        #Temporal Tracking Fix
+        epoch_end_time = time.perf_counter()
+        elapsed_time = epoch_end_time - epoch_start_time
+        
+        print(f"Epoch [{epoch + 1}/{epochs}] | Train Loss:{avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f} | Val Acc: {val_accuracy:.2f} | Time: {elapsed_time}s")
+        
+        
+        #Track Best States
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             
             
-        end_time = time
-            
-            
+        #Logging 
         epoch_metrics = {
             "epoch": epoch + 1,
-            "train_loss": running_loss /len(train_loader),
-            "train_acc": accuracy,
-            "time_taken": elapsed_time,
+            "train_loss": avg_train_loss,
+            "train_acc":train_accuracy,
+            "val_loss": avg_val_loss,
+            "val_acc":val_accuracy,
+            "time_taken":elapsed_time
         }
-        
-        
-        if avg_loss < best_val_loss:
-            best_val_loss = avg_loss
             
-            
-        state = {
-            "epoch":epoch_metrics["epoch"],
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "best_val_loss": best_val_loss,
-            "config": {
-                "lr":0.01,
-                "dropout": 0.5,
-                "weight_decay": 1e-4
-            }
-        }
-        
         
         history.append(epoch_metrics)
         
-        
-        if (epoch + 1) % 5 == 0 or avg_loss < best_val_loss:
-            pass
+       
         
     with open(f"./experiments/training_{config_name}_log.json","w") as f:
         json.dump(history, f, indent=4)
     
-    with open(f"./experiments/{config_name}_loss_log.json","w") as f:
+    with open(f"./experiments/{config_name}_gradient_log.json","w") as f:
         json.dump(epoch_gradient_history, f, indent=4)
+        
+        
+    total_time = time.perf_counter() - starting_time
+    print(f"Completed {config_name} in {total_time:.2f} seconds. Best Val Acc: {best_accuracy:.2f}%\n")
+    
+    return history, epoch_gradient_history
         
         
     
