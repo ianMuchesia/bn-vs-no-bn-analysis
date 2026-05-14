@@ -62,7 +62,9 @@ def training_model(model,config_name,train_loader,test_loader,device):
         
         
         # Accumulators for gradient magnitudes per layer for this specific epoch
-        grad_accumulators = {layer: 0.0 for layer in target_layers}
+        grad_accumulators_magnitude = {layer: 0.0 for layer in target_layers}
+        grad_accumulators_mean = {layer: 0.0 for layer in target_layers}
+        grad_accumulators_var = {layer: 0.0 for layer in target_layers}
         
         epoch_start_time = time.perf_counter()
         
@@ -89,7 +91,12 @@ def training_model(model,config_name,train_loader,test_loader,device):
                 if name in target_layers and param.grad is not None:
                     #Calculate the L2 norm (magnitude) of the gradient tensor
                     grad_magnitude = param.grad.data.norm(2).item()
-                    grad_accumulators[name] += grad_magnitude
+                    grad_mean = param.grad.data.mean().item()
+                    grad_var = param.grad.data.var().item()
+                    grad_accumulators_magnitude[name] += grad_magnitude
+                    
+                    grad_accumulators_mean[name] += grad_mean
+                    grad_accumulators_var[name] += grad_var
                 
             optimizer.step()
             
@@ -115,9 +122,12 @@ def training_model(model,config_name,train_loader,test_loader,device):
         
         epoch_grads = {}
         for layer in target_layers:
-            avg_grad = grad_accumulators[layer] / len(train_loader)
-            epoch_gradient_history[layer].append(avg_grad)
-            epoch_grads[layer] = avg_grad
+            avg_magnituede_grad = grad_accumulators_magnitude[layer] / len(train_loader)
+            avg_mean_grad = grad_accumulators_mean[layer] / len(train_loader)
+            avg_var_grad = grad_accumulators_var[layer] /len(train_loader)
+            grads = {"magnitude":avg_magnituede_grad,"mean":avg_mean_grad,"var":avg_var_grad}
+            epoch_gradient_history[layer].append(grads)
+            epoch_grads[layer] = grads
             
             
         #Validation Phase
